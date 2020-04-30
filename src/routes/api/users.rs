@@ -1,30 +1,19 @@
-use actix_web::{Error, HttpRequest, HttpResponse, FromRequest, dev, web};
-use actix_web_httpauth::extractors::AuthExtractor;
+use actix_web::{Error, HttpRequest, HttpResponse, FromRequest, dev, http, web};
+use actix_web_httpauth::middleware::HttpAuthentication;
 use futures::future;
+use mongodb;
 use std::pin::Pin;
-
-// #[derive(serde::Deserialize, serde::Serialize)]
-// struct UserToken {}
-
-// enum ServiceError {}
-
-// impl AuthExtractor for UserToken {
-//   type Error = Error;
-//   type Future = Pin<Box<dyn future::Future<Output = Result<UserToken, Error>>>>;
-
-//   fn from_service_request() {}
-// }
 
 #[derive(serde::Deserialize, serde::Serialize)]
 struct JwtToken {
   user_id: i8
 }
 
-fn get_header_map<'a>(req: &'a &HttpRequest) -> &'a actix_web::http::header::HeaderMap {
+fn get_header_map<'a>(req: &'a &HttpRequest) -> &'a http::header::HeaderMap {
   req.headers()
 }
 
-fn get_auth_header(headers: &actix_web::http::header::HeaderMap) -> &str {
+fn get_auth_header(headers: &http::header::HeaderMap) -> &str {
   match headers.get("Authorization") {
     Some(v) => &v.to_str().unwrap()[7..],
     None => ""
@@ -54,21 +43,72 @@ impl FromRequest for JwtToken {
   type Future = Pin<Box<dyn future::Future<Output = Result<JwtToken, Error>>>>;
   type Config = ();
 
-  fn from_request(req: &HttpRequest, _payload: &mut actix_web::dev::Payload) -> Self::Future {
+  fn from_request(req: &HttpRequest, _payload: &mut dev::Payload) -> Self::Future {
     let auth_header = get_auth_header(get_header_map(&req));
 
     decode_token(auth_header)
   }
 }
 
+#[derive(serde::Deserialize)]
+struct LoginBodyUser {
+  email: String,
+  password: String
+}
+
+#[derive(serde::Deserialize)]
+struct LoginBody {
+  user: LoginBodyUser
+}
+
+struct UserDocument {}
+
+trait UserModel {
+  fn valid_password() -> bool;
+}
+
+impl UserModel for UserDocument {
+  fn valid_password() -> bool {
+    true
+  }
+}
+
+fn authenticate(
+  LoginBodyUser { email, password }: &LoginBodyUser
+) -> Result<bson::Document, &str> {
+  let document = mongodb::Client::with_uri_str(&"mongodb://localhost:27017/")
+    .expect(&"Could not connect to database")
+    .database(&"db")
+    .collection("users")
+    .find_one(bson::doc! { email: email }, None);
+
+  match document {
+    Ok(user_option) => match user_option {
+      Some(user) => Ok(user),
+      None => Err("Invalid email or password")
+    },
+    Err(error) => {
+      println!("{}", error);
+      Err("Error connecting to database")
+    }
+  }
+}
+
 pub fn router(cfg: &mut web::ServiceConfig) {
-  cfg.service(
-    web::resource("/user").route(web::get().to(|token: JwtToken| {
-      // users.find_one(Some(doc! { "_id": r. }), None)
-      HttpResponse::Ok().json(token)
-      // .json(mongodb::Client::with_uri_str("mongodb://localhost:27017/").unwrap()
-      // .database("conduit")
-      // .collection("users"))
-    }))
-  );
+  cfg
+    .service(
+      web::resource("/user/login").route(
+        web::post().to(|body: web::Json<LoginBody>| {
+          authenticate(&body.user);
+
+          HttpResponse::Ok()
+        })
+      )
+    )
+    .service(
+      web::resource("/user")
+        .wrap(HttpAuthentication::bearer(|req, _credentials| async { Ok(req) }))
+        .route(web::get().to(|token: JwtToken| HttpResponse::Ok().json(token)))
+        .route(web::post().to(|| HttpResponse::Created()))
+    );
 }
