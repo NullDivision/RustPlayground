@@ -1,7 +1,8 @@
 use actix_web::{Error, HttpRequest, HttpResponse, FromRequest, dev, http, web};
 use actix_web_httpauth::middleware::HttpAuthentication;
 use futures::future;
-use mongodb;
+use mongodb::{Collection, Database};
+use bson::{doc};
 use std::pin::Pin;
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -74,11 +75,10 @@ impl UserModel for UserDocument {
 }
 
 fn authenticate(
-  LoginBodyUser { email, password }: &LoginBodyUser
+  LoginBodyUser { email, password: _password }: &LoginBodyUser,
+  db: web::Data<Database>
 ) -> Result<bson::Document, &str> {
-  let document = mongodb::Client::with_uri_str(&"mongodb://localhost:27017/")
-    .expect(&"Could not connect to database")
-    .database(&"db")
+  let document = db
     .collection("users")
     .find_one(bson::doc! { email: email }, None);
 
@@ -98,10 +98,14 @@ pub fn router(cfg: &mut web::ServiceConfig) {
   cfg
     .service(
       web::resource("/user/login").route(
-        web::post().to(|body: web::Json<LoginBody>| {
-          authenticate(&body.user);
-
-          HttpResponse::Ok()
+        web::post().to(|body: web::Json<LoginBody>, db: web::Data<Database>| {
+          match authenticate(&body.user, db) {
+            Ok(_) => HttpResponse::Ok(),
+            Err(err) => {
+              println!("{}", err);
+              HttpResponse::InternalServerError()
+            }
+          }
         })
       )
     )
@@ -109,6 +113,21 @@ pub fn router(cfg: &mut web::ServiceConfig) {
       web::resource("/user")
         .wrap(HttpAuthentication::bearer(|req, _credentials| async { Ok(req) }))
         .route(web::get().to(|token: JwtToken| HttpResponse::Ok().json(token)))
-        .route(web::post().to(|| HttpResponse::Created()))
+    )
+    .service(
+      web::resource("/users").route(
+        web::post()
+          .to(|_body: web::Json<LoginBody>, state: web::Data<crate::AppState>| {
+            let users: Collection = state.db.collection("users");
+
+            match users.insert_one(doc! {}, None) {
+              Ok(_) => HttpResponse::Created(),
+              Err(err) => {
+                println!("{}", err);
+                HttpResponse::InternalServerError()
+              }
+            }
+          })
+      )
     );
 }
