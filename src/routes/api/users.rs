@@ -1,20 +1,23 @@
-use actix_web::{Error, HttpRequest, HttpResponse, FromRequest, dev, http, web};
+use actix_web::{Error, HttpRequest, HttpResponse, FromRequest, dev, web};
+use actix_web::http::header::HeaderMap;
 use actix_web_httpauth::middleware::HttpAuthentication;
 use futures::future;
 use mongodb::{Collection, Database};
 use bson::{doc};
 use std::pin::Pin;
+use validator::{Validate};
+use serde::{Deserialize, Serialize};
 
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(Deserialize, Serialize)]
 struct JwtToken {
   user_id: i8
 }
 
-fn get_header_map<'a>(req: &'a &HttpRequest) -> &'a http::header::HeaderMap {
+fn get_header_map<'a>(req: &'a &HttpRequest) -> &'a HeaderMap {
   req.headers()
 }
 
-fn get_auth_header(headers: &http::header::HeaderMap) -> &str {
+fn get_auth_header(headers: &HeaderMap) -> &str {
   match headers.get("Authorization") {
     Some(v) => &v.to_str().unwrap()[7..],
     None => ""
@@ -51,27 +54,30 @@ impl FromRequest for JwtToken {
   }
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Deserialize, Validate)]
 struct LoginBodyUser {
+  #[validate(email)]
   email: String,
   password: String
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Deserialize, Validate)]
 struct LoginBody {
+  #[validate]
   user: LoginBodyUser
 }
 
-struct UserDocument {}
-
-trait UserModel {
-  fn valid_password() -> bool;
+#[derive(Deserialize, Validate)]
+struct CreateBodyUser {
+  email: String,
+  password: String,
+  username: String,
 }
 
-impl UserModel for UserDocument {
-  fn valid_password() -> bool {
-    true
-  }
+#[derive(Deserialize, Validate)]
+struct CreateBody {
+  #[validate]
+  user: CreateBodyUser
 }
 
 fn authenticate(
@@ -117,15 +123,30 @@ pub fn router(cfg: &mut web::ServiceConfig) {
     .service(
       web::resource("/users").route(
         web::post()
-          .to(|_body: web::Json<LoginBody>, state: web::Data<crate::AppState>| {
-            let users: Collection = state.db.collection("users");
+          .to(|body: web::Json<CreateBody>, state: web::Data<crate::AppState>| {
+            match body.validate() {
+              Ok(_) => {
+                let users: Collection = state.db.collection("users");
+                let result = users.insert_one(
+                  doc! {
+                    "email": &body.user.email,
+                    "password": &pbkdf2::pbkdf2_simple(&body.user.password, 16)
+                      .unwrap(),
+                    "username": &body.user.username
+                  },
+                  None
+                );
 
-            match users.insert_one(doc! {}, None) {
-              Ok(_) => HttpResponse::Created(),
-              Err(err) => {
-                println!("{}", err);
-                HttpResponse::InternalServerError()
+                match result {
+                  Ok(_) => HttpResponse::Created().finish(),
+                  Err(err) => {
+                    println!("{}", err);
+                    HttpResponse::InternalServerError().finish()
+
+                  }
+                }
               }
+              Err(err) => HttpResponse::BadRequest().json(err)
             }
           })
       )

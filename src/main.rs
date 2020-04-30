@@ -1,4 +1,9 @@
-use actix_web::{App, HttpServer, web};
+#[macro_use]
+extern crate validator_derive;
+extern crate validator;
+extern crate serde_json;
+
+use actix_web::{App, HttpServer};
 use mongodb::{Client, Database};
 
 mod routes;
