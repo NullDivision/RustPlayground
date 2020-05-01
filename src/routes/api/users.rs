@@ -2,6 +2,7 @@ use actix_web::{Error, HttpRequest, HttpResponse, FromRequest, dev, web};
 use actix_web::http::header::HeaderMap;
 use actix_web_httpauth::middleware::HttpAuthentication;
 use futures::future;
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use mongodb::{Collection, Database};
 use bson::{doc};
 use std::pin::Pin;
@@ -9,8 +10,9 @@ use validator::{Validate};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize)]
-struct JwtToken {
-  user_id: i8
+struct UserClaims {
+  exp: i64,
+  email: String
 }
 
 fn get_header_map<'a>(req: &'a &HttpRequest) -> &'a HeaderMap {
@@ -24,11 +26,11 @@ fn get_auth_header(headers: &HeaderMap) -> &str {
   }
 }
 
-fn decode_token(auth_header: &str) -> Pin<Box<dyn future::Future<Output = Result<JwtToken, Error>>>> {
-  let decode_value = jsonwebtoken::decode::<JwtToken>(
+fn decode_token(auth_header: &str) -> Pin<Box<dyn future::Future<Output = Result<UserClaims, Error>>>> {
+  let decode_value = decode::<UserClaims>(
     auth_header,
-    &jsonwebtoken::DecodingKey::from_secret(&"secret".as_ref()),
-    &jsonwebtoken::Validation::default()
+    &DecodingKey::from_secret(&"secret".as_ref()),
+    &Validation::default()
   );
 
   match decode_value {
@@ -37,14 +39,14 @@ fn decode_token(auth_header: &str) -> Pin<Box<dyn future::Future<Output = Result
     }),
     Err(v) => Box::pin(async move {
       println!("{}", v);
-      Ok(JwtToken { user_id: 0 })
+      Ok(UserClaims { exp: 0, email: "".to_string() })
     })
   }
 }
 
-impl FromRequest for JwtToken {
+impl FromRequest for UserClaims {
   type Error = Error;
-  type Future = Pin<Box<dyn future::Future<Output = Result<JwtToken, Error>>>>;
+  type Future = Pin<Box<dyn future::Future<Output = Result<UserClaims, Error>>>>;
   type Config = ();
 
   fn from_request(req: &HttpRequest, _payload: &mut dev::Payload) -> Self::Future {
@@ -80,45 +82,110 @@ struct CreateBody {
   user: CreateBodyUser
 }
 
-fn authenticate(
-  LoginBodyUser { email, password: _password }: &LoginBodyUser,
-  db: web::Data<Database>
-) -> Result<bson::Document, &str> {
-  let document = db
-    .collection("users")
-    .find_one(bson::doc! { email: email }, None);
+#[derive(Deserialize)]
+struct User {
+  bio: Option<String>,
+  email: String,
+  image: Option<String>,
+  password: String,
+  username: String
+}
 
-  match document {
-    Ok(user_option) => match user_option {
-      Some(user) => Ok(user),
-      None => Err("Invalid email or password")
+fn find_by_email(db: &Database, email: &str) -> Option<User> {
+  match db.collection("users").find_one(doc! { "email": &email }, None) {
+    Ok(user_option) => {
+      match user_option {
+        Some(user) => bson::from_bson(bson::Bson::Document(user)).unwrap(),
+        None => None
+      }
     },
-    Err(error) => {
-      println!("{}", error);
-      Err("Error connecting to database")
+    Err(_) => None
+  }
+}
+
+fn authenticate(
+  LoginBodyUser { email, password }: &LoginBodyUser,
+  db: &Database
+) -> Result<User, &'static str> {
+  match find_by_email(db, email) {
+    Some(user) => {
+      let result = pbkdf2::pbkdf2_check(
+        password,
+        &user.password
+      );
+
+      match result {
+        Ok(_) => Ok(user),
+        Err(_) => Err("Invalid password")
+      }
+    },
+    None => Err("User not found")
+  }
+}
+
+#[derive(Serialize)]
+struct LoginResponseUser {
+  bio: Option<String>,
+  email: String,
+  image: Option<String>,
+  token: String,
+  username: String
+}
+
+#[derive(Serialize)]
+struct LoginResponse {
+  user: LoginResponseUser
+}
+
+fn to_auth_json(user: User) -> LoginResponse {
+  let expires_on = chrono::Local::now() + chrono::Duration::days(60);
+
+  LoginResponse {
+    user: LoginResponseUser {
+      bio: user.bio,
+      email: user.email.to_string(),
+      image: user.image,
+      token: encode(
+        &Header::default(),
+        &UserClaims {
+          email: user.email,
+          exp: expires_on.timestamp()
+        },
+        &EncodingKey::from_secret("secret".as_ref())
+      ).unwrap(),
+      username: user.username
+    }
+  }
+}
+
+fn login(
+  body: web::Json<LoginBody>,
+  state: web::Data<crate::AppState>
+) -> HttpResponse {
+  match authenticate(&body.user, &state.db) {
+    Ok(user) => HttpResponse::Ok().json(to_auth_json(user)),
+    Err(err) => {
+      println!("{}", err);
+      HttpResponse::InternalServerError().finish()
     }
   }
 }
 
 pub fn router(cfg: &mut web::ServiceConfig) {
   cfg
-    .service(
-      web::resource("/user/login").route(
-        web::post().to(|body: web::Json<LoginBody>, db: web::Data<Database>| {
-          match authenticate(&body.user, db) {
-            Ok(_) => HttpResponse::Ok(),
-            Err(err) => {
-              println!("{}", err);
-              HttpResponse::InternalServerError()
-            }
-          }
-        })
-      )
-    )
+    .service(web::resource("/user/login").route(web::post().to(login)))
     .service(
       web::resource("/user")
         .wrap(HttpAuthentication::bearer(|req, _credentials| async { Ok(req) }))
-        .route(web::get().to(|token: JwtToken| HttpResponse::Ok().json(token)))
+        .route(
+          web::get()
+            .to(|token: UserClaims, state: web::Data<crate::AppState>| {
+              match find_by_email(&state.db, &token.email) {
+                Some(user) => HttpResponse::Ok().json(to_auth_json(user)),
+                None => HttpResponse::NotFound().finish()
+              }
+            })
+        )
     )
     .service(
       web::resource("/users").route(
