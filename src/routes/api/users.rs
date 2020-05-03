@@ -3,7 +3,7 @@ use actix_web::http::header::HeaderMap;
 use actix_web_httpauth::middleware::HttpAuthentication;
 use futures::future;
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
-use mongodb::{Collection, Database};
+use mongodb::{Collection, Database, options::{FindOneAndUpdateOptions, ReturnDocument}};
 use bson::{doc};
 use std::pin::Pin;
 use validator::{Validate};
@@ -171,21 +171,122 @@ fn login(
   }
 }
 
+fn get_user(
+  token: UserClaims,
+  state: web::Data<crate::AppState>
+) -> HttpResponse {
+  match find_by_email(&state.db, &token.email) {
+    Some(user) => HttpResponse::Ok().json(to_auth_json(user)),
+    None => HttpResponse::NotFound().finish()
+  }
+}
+
+#[derive(Deserialize)]
+struct UpdateUserEntity {
+  bio: Option<String>,
+  email: Option<String>,
+  image: Option<String>,
+  password: Option<String>,
+  username: Option<String>
+}
+
+#[derive(Deserialize)]
+struct UpdateUser {
+  user: UpdateUserEntity
+}
+
+fn generate_password(password: &str) -> Result<String, std::io::Error> {
+  pbkdf2::pbkdf2_simple(password, 16)
+}
+
+fn update_user(
+  body: web::Json<UpdateUser>,
+  token: UserClaims,
+  state: web::Data<crate::AppState>
+) -> HttpResponse {
+  let user = &body.user;
+
+  match find_by_email(&state.db, &token.email) {
+    Some(_) => {
+      let mut update_doc = doc!{};
+
+      match &user.username {
+        Some(username) => {
+          update_doc.insert("username", username);
+        },
+        _ => ()
+      };
+
+      match &user.email {
+        Some(email) => {
+          update_doc.insert("email", email);
+        },
+        _ => ()
+      };
+
+      match &user.bio {
+        Some(bio) => {
+          update_doc.insert("bio", bio);
+        },
+        _ => ()
+      };
+
+      match &user.image {
+        Some(image) => {
+          update_doc.insert("image", image);
+        },
+        _ => ()
+      };
+
+      match &user.password {
+        Some(password) => {
+          update_doc.insert("password", generate_password(password).unwrap());
+        },
+        _ => ()
+      };
+
+      if update_doc.len() == 0 {
+        return HttpResponse::UnprocessableEntity().finish();
+      }
+
+      let result = state.db
+        .collection("users")
+        .find_one_and_update(
+          doc!{ "email": token.email },
+          doc!{ "$set": update_doc },
+          FindOneAndUpdateOptions {
+            array_filters: None,
+            bypass_document_validation: None,
+            collation: None,
+            max_time: None,
+            projection: None,
+            return_document: Some(ReturnDocument::After),
+            sort: None,
+            upsert: None,
+            write_concern: None
+          }
+        );
+
+      match result {
+        Ok(result_user) => HttpResponse::Ok().json(result_user),
+        Err(err) => {
+          println!("{}", err);
+          HttpResponse::InternalServerError().finish()
+        }
+      }
+    },
+    None => HttpResponse::Unauthorized().finish()
+  }
+}
+
 pub fn router(cfg: &mut web::ServiceConfig) {
   cfg
     .service(web::resource("/user/login").route(web::post().to(login)))
     .service(
       web::resource("/user")
         .wrap(HttpAuthentication::bearer(|req, _credentials| async { Ok(req) }))
-        .route(
-          web::get()
-            .to(|token: UserClaims, state: web::Data<crate::AppState>| {
-              match find_by_email(&state.db, &token.email) {
-                Some(user) => HttpResponse::Ok().json(to_auth_json(user)),
-                None => HttpResponse::NotFound().finish()
-              }
-            })
-        )
+        .route(web::get().to(get_user))
+        .route(web::put().to(update_user))
     )
     .service(
       web::resource("/users").route(
@@ -197,8 +298,7 @@ pub fn router(cfg: &mut web::ServiceConfig) {
                 let result = users.insert_one(
                   doc! {
                     "email": &body.user.email,
-                    "password": &pbkdf2::pbkdf2_simple(&body.user.password, 16)
-                      .unwrap(),
+                    "password": &generate_password(&body.user.password).unwrap(),
                     "username": &body.user.username
                   },
                   None
