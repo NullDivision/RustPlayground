@@ -1,4 +1,4 @@
-use actix_web::{Error, HttpRequest, HttpResponse, FromRequest, dev, web};
+use actix_web::{Error, HttpRequest, HttpResponse, FromRequest, dev, error, web};
 use actix_web::http::header::HeaderMap;
 use actix_web_httpauth::middleware::HttpAuthentication;
 use futures::future;
@@ -12,10 +12,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Deserialize, Serialize)]
 struct UserClaims {
   exp: i64,
-  email: String
+  id: String,
+  username: String
 }
 
-fn get_header_map<'a>(req: &'a &HttpRequest) -> &'a HeaderMap {
+fn get_header_map(req: &HttpRequest) -> &HeaderMap {
   req.headers()
 }
 
@@ -39,7 +40,7 @@ fn decode_token(auth_header: &str) -> Pin<Box<dyn future::Future<Output = Result
     }),
     Err(v) => Box::pin(async move {
       println!("{}", v);
-      Ok(UserClaims { exp: 0, email: "".to_string() })
+      Err(Error::from(error::ErrorUnauthorized("Invalid token")))
     })
   }
 }
@@ -86,16 +87,55 @@ struct CreateBody {
 struct User {
   bio: Option<String>,
   email: String,
+  id: String,
   image: Option<String>,
   password: String,
   username: String
 }
 
-fn find_by_email(db: &Database, email: &str) -> Option<User> {
-  match db.collection("users").find_one(doc! { "email": &email }, None) {
+impl From<bson::ordered::OrderedDocument> for User {
+  fn from(document: bson::ordered::OrderedDocument) -> Self {
+    User {
+      bio: match document.get_str("bio") {
+        Ok(bio) => Some(bio.to_string()),
+        Err(_) => None
+      },
+      email: match document.get_str("email") {
+        Ok(email) => email.to_string(),
+        Err(_) => "".to_string()
+      },
+      id: match document.get_object_id("_id") {
+        Ok(id) => id.to_hex(),
+        Err(_) => "".to_string()
+      },
+      image: match document.get_str("image") {
+        Ok(image) => Some(image.to_string()),
+        Err(_) => None
+      },
+      password: match document.get_str("password") {
+        Ok(password) => password.to_string(),
+        Err(_) => "".to_string()
+      },
+      username: match document.get_str("username") {
+        Ok(username) => username.to_string(),
+        Err(_) => "".to_string()
+      },
+    }
+  }
+}
+
+fn find_by_id(db: &Database, id: &str) -> Option<User> {
+  let result = db
+    .collection("users")
+    .find_one(
+      doc!{ "_id": bson::oid::ObjectId::with_string(&id).unwrap() },
+      None
+    );
+
+  match result {
     Ok(user_option) => {
       match user_option {
-        Some(user) => bson::from_bson(bson::Bson::Document(user)).unwrap(),
+        Some(user) => Some(User::from(user)),
         None => None
       }
     },
@@ -103,28 +143,31 @@ fn find_by_email(db: &Database, email: &str) -> Option<User> {
   }
 }
 
-fn authenticate(
-  LoginBodyUser { email, password }: &LoginBodyUser,
+fn authenticate<'login>(
+  LoginBodyUser { email, password }: &'login LoginBodyUser,
   db: &Database
-) -> Result<User, &'static str> {
-  match find_by_email(db, email) {
-    Some(user) => {
-      let result = pbkdf2::pbkdf2_check(
-        password,
-        &user.password
-      );
+) -> Result<User, &'login str> {
+  match db.collection("users").find_one(doc!{ "email": email }, None) {
+    Ok(user_option) => match user_option {
+      Some(user) => {
+        let result = pbkdf2::pbkdf2_check(
+          password,
+          &user.get_str("password").unwrap()
+        );
 
-      match result {
-        Ok(_) => Ok(user),
-        Err(_) => Err("Invalid password")
-      }
+        match result {
+          Ok(_) => Ok(User::from(user)),
+          Err(_) => Err("Invalid password")
+        }
+      },
+      None => Err("User not found")
     },
-    None => Err("User not found")
+    Err(_) => Err("User not found")
   }
 }
 
 #[derive(Serialize)]
-struct LoginResponseUser {
+struct AuthToken {
   bio: Option<String>,
   email: String,
   image: Option<String>,
@@ -134,27 +177,32 @@ struct LoginResponseUser {
 
 #[derive(Serialize)]
 struct LoginResponse {
-  user: LoginResponseUser
+  user: AuthToken
 }
 
-fn to_auth_json(user: User) -> LoginResponse {
+fn to_auth_json(user: &User) -> AuthToken {
   let expires_on = chrono::Local::now() + chrono::Duration::days(60);
 
-  LoginResponse {
-    user: LoginResponseUser {
-      bio: user.bio,
-      email: user.email.to_string(),
-      image: user.image,
-      token: encode(
-        &Header::default(),
-        &UserClaims {
-          email: user.email,
-          exp: expires_on.timestamp()
-        },
-        &EncodingKey::from_secret("secret".as_ref())
-      ).unwrap(),
-      username: user.username
-    }
+  AuthToken {
+    bio: match user.bio.as_ref() {
+      Some(bio) => Some(bio.to_string()),
+      None => None
+    },
+    email: user.email.to_string(),
+    image: match user.image.as_ref() {
+      Some(image) => Some(image.to_string()),
+      None => None
+    },
+    token: encode(
+      &Header::default(),
+      &UserClaims {
+        exp: expires_on.timestamp(),
+        id: String::from(&user.id),
+        username: String::from(&user.username)
+      },
+      &EncodingKey::from_secret("secret".as_ref())
+    ).unwrap(),
+    username: String::from(&user.username)
   }
 }
 
@@ -163,7 +211,7 @@ fn login(
   state: web::Data<crate::AppState>
 ) -> HttpResponse {
   match authenticate(&body.user, &state.db) {
-    Ok(user) => HttpResponse::Ok().json(to_auth_json(user)),
+    Ok(user) => HttpResponse::Ok().json(LoginResponse { user: to_auth_json(&user) }),
     Err(err) => {
       println!("{}", err);
       HttpResponse::InternalServerError().finish()
@@ -175,8 +223,8 @@ fn get_user(
   token: UserClaims,
   state: web::Data<crate::AppState>
 ) -> HttpResponse {
-  match find_by_email(&state.db, &token.email) {
-    Some(user) => HttpResponse::Ok().json(to_auth_json(user)),
+  match find_by_id(&state.db, &token.id) {
+    Some(user) => HttpResponse::Ok().json(to_auth_json(&user)),
     None => HttpResponse::NotFound().finish()
   }
 }
@@ -206,7 +254,7 @@ fn update_user(
 ) -> HttpResponse {
   let user = &body.user;
 
-  match find_by_email(&state.db, &token.email) {
+  match find_by_id(&state.db, &token.id) {
     Some(_) => {
       let mut update_doc = doc!{};
 
@@ -252,7 +300,7 @@ fn update_user(
       let result = state.db
         .collection("users")
         .find_one_and_update(
-          doc!{ "email": token.email },
+          doc!{ "_id": bson::oid::ObjectId::with_string(&token.id).unwrap() },
           doc!{ "$set": update_doc },
           FindOneAndUpdateOptions {
             array_filters: None,
